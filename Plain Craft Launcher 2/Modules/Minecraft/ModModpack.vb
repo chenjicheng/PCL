@@ -1168,9 +1168,8 @@ Retry:
 
         '检查文件类型特征
         Dim Files = DirInfo.GetFiles("*", SearchOption.TopDirectoryOnly)
-        Dim HasDataFiles = Files.Any(Function(f)
-            Return f.Extension.ToLower() In {".dat", ".nbt", ".json", ".yml", ".conf", ".cfg", ".txt", ".schematic"}
-        End Function)
+        Dim DataExtensions = {".dat", ".nbt", ".json", ".yml", ".conf", ".cfg", ".txt", ".schematic"}
+        Dim HasDataFiles = Files.Any(Function(f) DataExtensions.Contains(f.Extension.ToLower()))
 
         '包含数据文件则可能是mod文件夹
         Return HasDataFiles
