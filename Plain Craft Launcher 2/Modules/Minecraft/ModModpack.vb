@@ -200,6 +200,9 @@ Retry:
             If String.IsNullOrEmpty(VersionName) Then Throw New CancelledException
         End If
 
+        '检查并处理旧版本数据迁移
+        VersionName = CheckAndMigrateOldVersion(VersionName)
+
         '获取 Mod API 版本信息
         Dim ForgeVersion As String = Nothing
         Dim NeoForgeVersion As String = Nothing
@@ -399,6 +402,10 @@ Retry:
             If VersionName = "" Then VersionName = MyMsgBoxInput("输入版本名称", "", "", New ObjectModel.Collection(Of Validate) From {Validate})
             If String.IsNullOrEmpty(VersionName) Then Throw New CancelledException
         End If
+
+        '检查并处理旧版本数据迁移
+        VersionName = CheckAndMigrateOldVersion(VersionName)
+
         '解压
         Dim InstallTemp As String = RequestTaskTempFolder()
         Dim InstallLoaders As New List(Of LoaderBase)
@@ -699,6 +706,10 @@ Retry:
             If VersionName = "" Then VersionName = MyMsgBoxInput("输入版本名称", "", "", New ObjectModel.Collection(Of Validate) From {Validate})
             If String.IsNullOrEmpty(VersionName) Then Throw New CancelledException
         End If
+
+        '检查并处理旧版本数据迁移
+        VersionName = CheckAndMigrateOldVersion(VersionName)
+
         '解压
         Dim InstallTemp As String = RequestTaskTempFolder()
         Dim SetupFile As String = $"{PathMcFolder}versions\{VersionName}\PCL\Setup.ini"
@@ -862,6 +873,513 @@ Retry:
         FrmMain.BtnExtraDownload.Ribble()
         Return Loader
     End Function
+
+#End Region
+
+#Region "整合包升级数据迁移"
+
+    ''' <summary>
+    ''' 检查并处理同名版本的数据迁移
+    ''' </summary>
+    ''' <returns>返回处理后的版本名（可能被修改）</returns>
+    Private Function CheckAndMigrateOldVersion(VersionName As String) As String
+        Dim OldVersionPath As String = $"{PathMcFolder}versions\{VersionName}"
+
+        If Not Directory.Exists(OldVersionPath) Then
+            Return VersionName '不存在旧版本，直接返回
+        End If
+
+        '检测版本隔离设置
+        Dim HasVersionIsolation = Setup.Get("VersionArgumentIndieV2", Version:=New McVersion(OldVersionPath))
+        Dim HasImportantData = False
+
+        '快速检查是否有重要数据
+        If Directory.Exists(Path.Combine(OldVersionPath, "saves")) AndAlso
+           New DirectoryInfo(Path.Combine(OldVersionPath, "saves")).GetDirectories().Any() Then
+            HasImportantData = True
+        End If
+
+        '根据是否有重要数据调整提示
+        Dim Message As String
+        If HasImportantData Then
+            Message = $"发现已存在同名版本 {VersionName}，检测到该版本包含游戏存档。{vbCrLf}{vbCrLf}是否要迁移旧版本的数据到新版本？这将保留你的存档、设置和mod数据。"
+        Else
+            Message = $"发现已存在同名版本 {VersionName}。{vbCrLf}{vbCrLf}是否要迁移旧版本的数据到新版本？"
+        End If
+
+        Select Case MyMsgBox(Message, "检测到旧版本", "迁移数据并继续", "直接覆盖安装", "取消")
+            Case 1 '迁移数据
+                '启动迁移流程
+                Dim NewVersionName = GetUniqueVersionName(VersionName)
+                Dim MigrationLoader = ModpackUpgrade(NewVersionName, OldVersionPath)
+
+                If MigrationLoader IsNot Nothing Then
+                    '启动迁移任务
+                    MigrationLoader.Start()
+                    LoaderTaskbarAdd(MigrationLoader)
+
+                    '等待迁移完成
+                    Do While MigrationLoader.State = LoaderState.Loading
+                        Thread.Sleep(100)
+                    Loop
+
+                    If MigrationLoader.State = LoaderState.Finished Then
+                        Log($"[ModPack] 数据迁移成功，新版本名：{NewVersionName}")
+                        Return NewVersionName
+                    Else
+                        Log($"[ModPack] 数据迁移失败，使用原版本名：{VersionName}")
+                        If MyMsgBox("数据迁移失败，是否继续覆盖安装？", "迁移失败", "继续", "取消") = 2 Then
+                            Throw New CancelledException
+                        End If
+                    End If
+                End If
+
+                Return VersionName
+
+            Case 2 '直接覆盖
+                If HasImportantData Then
+                    If MyMsgBox($"确定要覆盖现有版本 {VersionName} 吗？{vbCrLf}{vbCrLf}⚠️ 警告：这将永久删除所有存档和数据！",
+                              "最终确认", "确定删除", "取消") = 2 Then
+                        Throw New CancelledException
+                    End If
+                End If
+                Return VersionName
+
+            Case Else '取消
+                Throw New CancelledException
+        End Select
+    End Function
+
+    ''' <summary>
+    ''' 获取一个不重复的版本名
+    ''' </summary>
+    Private Function GetUniqueVersionName(BaseName As String) As String
+        Dim NewName = BaseName & "_new"
+        Dim Counter = 1
+
+        While Directory.Exists($"{PathMcFolder}versions\{NewName}")
+            Counter += 1
+            NewName = BaseName & $"_new{Counter}"
+        End While
+
+        Return NewName
+    End Function
+
+    '已知的mod数据文件夹映射表
+    Private ReadOnly ModDataFolders As New Dictionary(Of String, String) From {
+        {"XaeroWaypoints", "Xaero小地图路径点"},
+        {"XaeroWorldMap", "Xaero世界地图数据"},
+        {"schematics", "Litematica/Schematica建筑蓝图"},
+        {"journeymap", "JourneyMap地图数据"},
+        {"voxelmap", "VoxelMap地图数据"},
+        {"rei", "REI配置"},
+        {"jei", "JEI配置"},
+        {"emi", "EMI配置"},
+        {"worldedit", "WorldEdit数据"},
+        {"structurize", "Structurize蓝图"},
+        {"create-schematics", "机械动力蓝图"},
+        {"blueprints", "BuildCraft蓝图"},
+        {"ftbbackups", "FTB备份"},
+        {"ftbchunks", "FTB区块数据"},
+        {"ftbquests", "FTB任务数据"},
+        {"ftb-teams", "FTB团队数据"},
+        {"essential", "Essential配置"},
+        {"simple-rpc", "Discord RPC配置"},
+        {"bobby", "Bobby缓存数据"},
+        {"distant-horizons-server-data", "Distant Horizons LOD数据"},
+        {"iris", "Iris光影配置"},
+        {"meteor-client", "Meteor客户端配置"},
+        {"wurst", "Wurst客户端配置"},
+        {"baritone", "Baritone路径数据"},
+        {"minimap", "小地图数据"},
+        {"mapwriter", "MapWriter地图数据"},
+        {"betterquesting", "Better Questing任务数据"},
+        {"opencomputers", "OpenComputers数据"},
+        {"computercraft", "ComputerCraft程序"},
+        {"mystcraft", "Mystcraft时代数据"},
+        {"thaumcraft", "Thaumcraft研究数据"},
+        {"galacticraft", "GalactiCraft数据"},
+        {"buildcraft", "BuildCraft配置"},
+        {"industrialcraft", "IndustrialCraft配置"},
+        {"applied-energistics-2", "AE2配置"},
+        {"railcraft", "Railcraft配置"},
+        {"tinkers-construct", "匠魂配置"},
+        {"botania", "植物魔法配置"},
+        {"blood-magic", "血魔法配置"},
+        {"astral-sorcery", "星辉魔法配置"},
+        {"immersive-engineering", "沉浸工程配置"},
+        {"mekanism", "通用机械配置"}
+    }
+
+    ''' <summary>
+    ''' 整合包升级时的数据迁移入口函数
+    ''' </summary>
+    Public Function ModpackUpgrade(NewVersionName As String, OldVersionPath As String) As LoaderCombo(Of String)
+        Log($"[ModPack] 开始整合包升级数据迁移：从 {OldVersionPath} 到 {NewVersionName}")
+
+        '检测可迁移的数据
+        Dim MigrationItems = DetectMigrationItems(OldVersionPath)
+        If MigrationItems.Count = 0 Then
+            Log("[ModPack] 未检测到可迁移的数据")
+            Return Nothing
+        End If
+
+        '显示迁移选择对话框
+        Dim SelectedItems = ShowMigrationDialog(MigrationItems, OldVersionPath, NewVersionName)
+        If SelectedItems Is Nothing OrElse SelectedItems.Count = 0 Then
+            Log("[ModPack] 用户取消数据迁移")
+            Return Nothing
+        End If
+
+        '创建迁移任务
+        Dim Loader As New LoaderCombo(Of String)("整合包数据迁移", {
+            New LoaderTask(Of String, Integer)("创建备份",
+            Sub(Task As LoaderTask(Of String, Integer))
+                CreateMigrationBackup(OldVersionPath, SelectedItems, Task)
+                Task.Progress = 1
+            End Sub) With {.ProgressWeight = 1},
+            New LoaderTask(Of String, Integer)("迁移数据",
+            Sub(Task As LoaderTask(Of String, Integer))
+                MigrateVersionData(OldVersionPath, $"{PathMcFolder}versions\{NewVersionName}", SelectedItems, Task)
+                Task.Progress = 1
+            End Sub) With {.ProgressWeight = 3}
+        })
+
+        Return Loader
+    End Function
+
+    ''' <summary>
+    ''' 检测可迁移的数据项
+    ''' </summary>
+    Private Function DetectMigrationItems(VersionPath As String) As List(Of MigrationItem)
+        Dim Items As New List(Of MigrationItem)
+
+        '检测标准文件夹
+        AddStandardFolderItem(Items, VersionPath, "saves", "游戏存档", True)
+        AddStandardFolderItem(Items, VersionPath, "screenshots", "游戏截图", False)
+        AddStandardFolderItem(Items, VersionPath, "resourcepacks", "资源包", False)
+        AddStandardFolderItem(Items, VersionPath, "shaderpacks", "光影包", False)
+        AddStandardFolderItem(Items, VersionPath, "configs", "Mod配置", False)
+        AddStandardFolderItem(Items, VersionPath, "config", "Mod配置", False) '两种命名都检查
+
+        '检测标准文件
+        AddStandardFileItem(Items, VersionPath, "options.txt", "游戏设置", True)
+        AddStandardFileItem(Items, VersionPath, "servers.dat", "服务器列表", True)
+        AddStandardFileItem(Items, VersionPath, "hotbar.nbt", "快捷栏", False)
+
+        '检测已知的mod文件夹
+        For Each ModFolder In ModDataFolders
+            Dim FolderPath = Path.Combine(VersionPath, ModFolder.Key)
+            If Directory.Exists(FolderPath) Then
+                Dim DirInfo As New DirectoryInfo(FolderPath)
+                Items.Add(New MigrationItem With {
+                    .RelativePath = ModFolder.Key,
+                    .DisplayName = ModFolder.Value,
+                    .ItemType = MigrationItemType.ModFolder,
+                    .Size = GetDirectorySize(DirInfo),
+                    .IsDefault = False,
+                    .IsKnown = True
+                })
+            End If
+        Next
+
+        '检测未知但可能的mod文件夹
+        Dim RootDir As New DirectoryInfo(VersionPath)
+        For Each SubDir In RootDir.GetDirectories()
+            If Not IsStandardMinecraftFolder(SubDir.Name) AndAlso
+               Not ModDataFolders.ContainsKey(SubDir.Name) Then
+                '基于特征判断是否可能是mod数据
+                If IsPossibleModDataFolder(SubDir) Then
+                    Items.Add(New MigrationItem With {
+                        .RelativePath = SubDir.Name,
+                        .DisplayName = $"{SubDir.Name} (未识别)",
+                        .ItemType = MigrationItemType.UnknownFolder,
+                        .Size = GetDirectorySize(SubDir),
+                        .IsDefault = False,
+                        .IsKnown = False
+                    })
+                End If
+            End If
+        Next
+
+        Return Items
+    End Function
+
+    ''' <summary>
+    ''' 添加标准文件夹项
+    ''' </summary>
+    Private Sub AddStandardFolderItem(Items As List(Of MigrationItem), BasePath As String,
+                                      FolderName As String, DisplayName As String, IsDefault As Boolean)
+        Dim FolderPath = Path.Combine(BasePath, FolderName)
+        If Directory.Exists(FolderPath) Then
+            Dim DirInfo As New DirectoryInfo(FolderPath)
+            If DirInfo.GetFiles("*", SearchOption.AllDirectories).Any() Then '有内容才添加
+                Items.Add(New MigrationItem With {
+                    .RelativePath = FolderName,
+                    .DisplayName = DisplayName,
+                    .ItemType = MigrationItemType.StandardFolder,
+                    .Size = GetDirectorySize(DirInfo),
+                    .IsDefault = IsDefault,
+                    .IsKnown = True
+                })
+            End If
+        End If
+    End Sub
+
+    ''' <summary>
+    ''' 添加标准文件项
+    ''' </summary>
+    Private Sub AddStandardFileItem(Items As List(Of MigrationItem), BasePath As String,
+                                    FileName As String, DisplayName As String, IsDefault As Boolean)
+        Dim FilePath = Path.Combine(BasePath, FileName)
+        If File.Exists(FilePath) Then
+            Dim FileInfo As New FileInfo(FilePath)
+            Items.Add(New MigrationItem With {
+                .RelativePath = FileName,
+                .DisplayName = DisplayName,
+                .ItemType = MigrationItemType.StandardFile,
+                .Size = FileInfo.Length,
+                .IsDefault = IsDefault,
+                .IsKnown = True
+            })
+        End If
+    End Sub
+
+    ''' <summary>
+    ''' 判断是否是标准的Minecraft文件夹
+    ''' </summary>
+    Private Function IsStandardMinecraftFolder(FolderName As String) As Boolean
+        Dim StandardFolders = {"assets", "libraries", "logs", "versions", "crash-reports",
+                               "saves", "screenshots", "resourcepacks", "shaderpacks",
+                               "mods", "config", "configs", ".mixin.out", "natives",
+                               "PCL", "backups", "replay_recordings", "replay_videos"}
+        Return StandardFolders.Contains(FolderName.ToLower())
+    End Function
+
+    ''' <summary>
+    ''' 基于特征判断是否可能是mod数据文件夹
+    ''' </summary>
+    Private Function IsPossibleModDataFolder(DirInfo As DirectoryInfo) As Boolean
+        '跳过空文件夹
+        If Not DirInfo.GetFiles("*", SearchOption.AllDirectories).Any() Then Return False
+
+        '跳过过大的文件夹(>2GB)
+        If GetDirectorySize(DirInfo) > 2L * 1024 * 1024 * 1024 Then Return False
+
+        '检查文件类型特征
+        Dim Files = DirInfo.GetFiles("*", SearchOption.TopDirectoryOnly)
+        Dim HasDataFiles = Files.Any(Function(f)
+            Return f.Extension.ToLower() In {".dat", ".nbt", ".json", ".yml", ".conf", ".cfg", ".txt", ".schematic"}
+        End Function)
+
+        '包含数据文件则可能是mod文件夹
+        Return HasDataFiles
+    End Function
+
+    ''' <summary>
+    ''' 获取文件夹大小
+    ''' </summary>
+    Private Function GetDirectorySize(DirInfo As DirectoryInfo) As Long
+        Try
+            Return DirInfo.GetFiles("*", SearchOption.AllDirectories).Sum(Function(f) f.Length)
+        Catch ex As Exception
+            Return 0
+        End Try
+    End Function
+
+    ''' <summary>
+    ''' 显示迁移选择对话框
+    ''' </summary>
+    Private Function ShowMigrationDialog(Items As List(Of MigrationItem),
+                                        OldPath As String, NewVersion As String) As List(Of MigrationItem)
+        '构建对话框内容
+        Dim CoreItems = Items.Where(Function(i) i.IsDefault).ToList()
+        Dim OptionalItems = Items.Where(Function(i) Not i.IsDefault AndAlso i.ItemType <> MigrationItemType.UnknownFolder).ToList()
+        Dim UnknownItems = Items.Where(Function(i) i.ItemType = MigrationItemType.UnknownFolder).ToList()
+
+        Dim Message As New List(Of String)
+        Message.Add($"检测到旧版本整合包数据，是否要迁移到新版本 {NewVersion}？")
+        Message.Add("")
+
+        If CoreItems.Any() Then
+            Message.Add("【核心数据】（推荐迁移）")
+            For Each Item In CoreItems
+                Message.Add($"• {Item.DisplayName} ({GetFriendlySize(Item.Size)})")
+            Next
+        End If
+
+        If OptionalItems.Any() Then
+            Message.Add("")
+            Message.Add("【可选数据】")
+            For Each Item In OptionalItems
+                Message.Add($"• {Item.DisplayName} ({GetFriendlySize(Item.Size)})")
+            Next
+        End If
+
+        If UnknownItems.Any() Then
+            Message.Add("")
+            Message.Add("【未识别文件夹】（谨慎选择）")
+            For Each Item In UnknownItems
+                Message.Add($"• {Item.DisplayName} ({GetFriendlySize(Item.Size)})")
+            Next
+        End If
+
+        '显示对话框
+        Select Case MyMsgBox(String.Join(vbCrLf, Message), "整合包数据迁移", "全部迁移", "仅迁移核心", "取消")
+            Case 1 '全部迁移
+                Return Items
+            Case 2 '仅核心
+                Return CoreItems
+            Case Else '取消
+                Return Nothing
+        End Select
+    End Function
+
+    ''' <summary>
+    ''' 获取友好的文件大小显示
+    ''' </summary>
+    Private Function GetFriendlySize(Bytes As Long) As String
+        If Bytes < 1024 Then
+            Return $"{Bytes} B"
+        ElseIf Bytes < 1024 * 1024 Then
+            Return $"{Math.Round(Bytes / 1024, 1)} KB"
+        ElseIf Bytes < 1024 * 1024 * 1024 Then
+            Return $"{Math.Round(Bytes / 1024 / 1024, 1)} MB"
+        Else
+            Return $"{Math.Round(Bytes / 1024 / 1024 / 1024, 2)} GB"
+        End If
+    End Function
+
+    ''' <summary>
+    ''' 创建迁移备份
+    ''' </summary>
+    Private Sub CreateMigrationBackup(OldPath As String, Items As List(Of MigrationItem), Task As LoaderTask(Of String, Integer))
+        Dim BackupPath = Path.Combine(PathMcFolder, "backups", $"migration_{DateTime.Now:yyyyMMdd_HHmmss}")
+        Directory.CreateDirectory(BackupPath)
+        Log($"[ModPack] 创建迁移备份：{BackupPath}")
+
+        Dim Progress As Double = 0
+        Dim ItemCount = Items.Count
+
+        For Each Item In Items
+            Dim SourcePath = Path.Combine(OldPath, Item.RelativePath)
+            Dim TargetPath = Path.Combine(BackupPath, Item.RelativePath)
+
+            Try
+                If Item.ItemType = MigrationItemType.StandardFile Then
+                    CopyFile(SourcePath, TargetPath)
+                Else
+                    '对于大文件夹，可以考虑使用压缩备份节省空间
+                    If Item.Size > 100 * 1024 * 1024 Then '大于100MB
+                        Log($"[ModPack] 大文件夹备份：{Item.RelativePath} ({GetFriendlySize(Item.Size)})")
+                    End If
+                    CopyDirectory(SourcePath, TargetPath)
+                End If
+            Catch ex As Exception
+                Log(ex, $"备份失败：{Item.RelativePath}")
+            End Try
+
+            Progress += 1 / ItemCount
+            Task.Progress = Progress
+        Next
+    End Sub
+
+    ''' <summary>
+    ''' 执行数据迁移
+    ''' </summary>
+    Private Sub MigrateVersionData(OldPath As String, NewPath As String,
+                                  Items As List(Of MigrationItem), Task As LoaderTask(Of String, Integer))
+        Log($"[ModPack] 开始迁移数据：{OldPath} → {NewPath}")
+
+        Dim Progress As Double = 0
+        Dim ItemCount = Items.Count
+
+        For Each Item In Items
+            Dim SourcePath = Path.Combine(OldPath, Item.RelativePath)
+            Dim TargetPath = Path.Combine(NewPath, Item.RelativePath)
+
+            Try
+                '检查目标是否已存在
+                Dim ShouldCopy = True
+                If (File.Exists(TargetPath) OrElse Directory.Exists(TargetPath)) Then
+                    '对于某些文件采用合并策略而非覆盖
+                    Select Case Item.RelativePath.ToLower()
+                        Case "options.txt", "servers.dat"
+                            '这些文件询问用户
+                            If MyMsgBox($"文件 {Item.DisplayName} 在新版本已存在，是否覆盖？", "文件冲突", "覆盖", "跳过") = 2 Then
+                                ShouldCopy = False
+                            End If
+                        Case "saves"
+                            '存档文件夹采用合并策略
+                            Log($"[ModPack] 合并存档文件夹")
+                            MergeSavesFolder(SourcePath, TargetPath)
+                            ShouldCopy = False
+                    End Select
+                End If
+
+                If ShouldCopy Then
+                    If Item.ItemType = MigrationItemType.StandardFile Then
+                        CopyFile(SourcePath, TargetPath)
+                    Else
+                        CopyDirectory(SourcePath, TargetPath, Sub(Delta) Task.Progress += Delta * (1 / ItemCount))
+                    End If
+                    Log($"[ModPack] 已迁移：{Item.RelativePath}")
+                End If
+            Catch ex As Exception
+                Log(ex, $"迁移失败：{Item.RelativePath}")
+            End Try
+
+            Progress += 1 / ItemCount
+            If Task.Progress < Progress Then Task.Progress = Progress
+        Next
+
+        Log("[ModPack] 数据迁移完成")
+        Hint("整合包数据迁移完成！", HintType.Finish)
+    End Sub
+
+    ''' <summary>
+    ''' 合并存档文件夹
+    ''' </summary>
+    Private Sub MergeSavesFolder(SourceSaves As String, TargetSaves As String)
+        If Not Directory.Exists(TargetSaves) Then
+            Directory.CreateDirectory(TargetSaves)
+        End If
+
+        For Each SaveDir In New DirectoryInfo(SourceSaves).GetDirectories()
+            Dim TargetSaveDir = Path.Combine(TargetSaves, SaveDir.Name)
+            If Not Directory.Exists(TargetSaveDir) Then
+                '不存在则直接复制
+                CopyDirectory(SaveDir.FullName, TargetSaveDir)
+            Else
+                '存在则重命名
+                Dim NewName = SaveDir.Name & "_old"
+                Dim Counter = 1
+                While Directory.Exists(Path.Combine(TargetSaves, NewName))
+                    NewName = SaveDir.Name & $"_old{Counter}"
+                    Counter += 1
+                End While
+                CopyDirectory(SaveDir.FullName, Path.Combine(TargetSaves, NewName))
+                Log($"[ModPack] 存档重命名：{SaveDir.Name} → {NewName}")
+            End If
+        Next
+    End Sub
+
+    '数据结构定义
+    Private Class MigrationItem
+        Public Property RelativePath As String
+        Public Property DisplayName As String
+        Public Property ItemType As MigrationItemType
+        Public Property Size As Long
+        Public Property IsDefault As Boolean
+        Public Property IsKnown As Boolean
+    End Class
+
+    Private Enum MigrationItemType
+        StandardFolder
+        StandardFile
+        ModFolder
+        UnknownFolder
+    End Enum
 
 #End Region
 
